@@ -25,6 +25,7 @@
 #include "kernel/celltypes.h"
 #include "kernel/log.h"
 #include "kernel/sigtools.h"
+#include "kernel/modtools.h"
 #include <string>
 #include <sstream>
 #include <set>
@@ -33,15 +34,17 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-bool verbose, norename, noattr, attr2comment, noexpr, nodec, nohex, nostr, defparam, decimal;
+bool verbose, norename, noattr, attr2comment, noexpr, noinline, nodec, nohex, nostr, defparam, decimal;
 int auto_name_counter, auto_name_offset, auto_name_digits;
 std::map<RTLIL::IdString, int> auto_name_map;
 std::set<RTLIL::IdString> reg_wires, reg_ct;
+std::map<RTLIL::Wire*, int> proc_consumed_wires;
 std::string auto_prefix;
 
 RTLIL::Module *active_module;
 dict<RTLIL::SigBit, RTLIL::State> active_initdata;
 SigMap active_sigmap;
+ModIndex active_modindex;
 
 void reset_auto_counter_id(RTLIL::IdString id, bool may_rename)
 {
@@ -154,6 +157,62 @@ bool is_reg_wire(RTLIL::SigSpec sig, std::string &reg_name)
 	}
 
 	return true;
+}
+
+bool can_inline_cell_expr(RTLIL::Cell *cell)
+{
+	static pool<IdString> inlinable_cells = {
+		"$not", "$pos", "$neg",
+		"$and", "$or", "$xor", "$xnor",
+		"$reduce_and", "$reduce_or", "$reduce_xor", "$reduce_xnor", "$reduce_bool",
+		"$shl", "$shr", "$sshl", "$sshr",
+		"$lt", "$le", "$eq", "$ne", "$eqx", "$nex", "$ge", "$gt",
+		"$add", "$sub", "$mul", "$div", "$mod", "$pow",
+		"$logic_not", "$logic_and", "$logic_or",
+		"$mux"
+	};
+
+	if (noinline)
+		return false;
+
+	if (!inlinable_cells.count(cell->type))
+		return false;
+
+	const RTLIL::SigSpec &output = cell->getPort("\\Y");
+	if (!output.is_wire())
+		return false;
+
+	RTLIL::Wire *output_wire = output.as_wire();
+	if (output_wire->port_id || output_wire->attributes.size())
+		return false;
+
+	pool<ModIndex::PortInfo> ports = active_modindex.query_ports(output[0]);
+	return (ports.size() == 2 && proc_consumed_wires[output_wire] == 0) ||
+				 (ports.size() == 1 && proc_consumed_wires[output_wire] == 1);
+}
+
+bool can_inline_wire(RTLIL::Wire *wire)
+{
+	if (noinline)
+		return false;
+
+	RTLIL::SigSpec wire_spec = RTLIL::SigSpec(wire);
+	if (wire_spec.empty())
+		return false;
+
+	pool<ModIndex::PortInfo> ports = active_modindex.query_ports(wire_spec[0]);
+	if (ports.size() > 2)
+		return false;
+
+	for (auto &port_info : ports)
+	{
+		if (port_info.cell->name[0] == '$' && port_info.port == "\\Y")
+		{
+			if (can_inline_cell_expr(port_info.cell))
+				return true;
+		}
+	}
+	return false;
 }
 
 void dump_const(std::ostream &f, const RTLIL::Const &data, int width = -1, int offset = 0, bool no_decimal = false, bool set_signed = false, bool escape_comment = false)
@@ -286,13 +345,27 @@ void dump_reg_init(std::ostream &f, SigSpec sig)
 	}
 }
 
+bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell, bool do_inline);
+
 void dump_sigchunk(std::ostream &f, const RTLIL::SigChunk &chunk, bool no_decimal = false)
 {
 	if (chunk.wire == NULL) {
 		dump_const(f, chunk.data, chunk.width, chunk.offset, no_decimal);
 	} else {
 		if (chunk.width == chunk.wire->width && chunk.offset == 0) {
-			f << stringf("%s", id(chunk.wire->name).c_str());
+			if (can_inline_wire(chunk.wire))
+			{
+				pool<ModIndex::PortInfo> ports = active_modindex.query_ports(SigSpec(chunk)[0]);
+				for (auto &port_info : ports)
+				{
+					if (port_info.port == "\\Y")
+						dump_cell_expr(f, "", port_info.cell, true);
+				}
+			}
+			else
+			{
+				f << stringf("%s", id(chunk.wire->name).c_str());
+			}
 		} else if (chunk.width == 1) {
 			if (chunk.wire->upto)
 				f << stringf("%s[%d]", id(chunk.wire->name).c_str(), (chunk.wire->width - chunk.offset - 1) + chunk.wire->start_offset);
@@ -345,6 +418,9 @@ void dump_attributes(std::ostream &f, std::string indent, dict<RTLIL::IdString, 
 
 void dump_wire(std::ostream &f, std::string indent, RTLIL::Wire *wire)
 {
+	if (can_inline_wire(wire))
+		return;
+
 	dump_attributes(f, indent, wire->attributes);
 #if 0
 	if (wire->port_input && !wire->port_output)
@@ -437,30 +513,54 @@ no_special_reg_name:
 	}
 }
 
-void dump_cell_expr_uniop(std::ostream &f, std::string indent, RTLIL::Cell *cell, std::string op)
+void dump_cell_expr_uniop(std::ostream &f, std::string indent, RTLIL::Cell *cell, std::string op, bool do_inline)
 {
-	f << stringf("%s" "assign ", indent.c_str());
-	dump_sigspec(f, cell->getPort("\\Y"));
-	f << stringf(" = %s ", op.c_str());
+	if (!do_inline)
+	{
+		f << stringf("%s" "assign ", indent.c_str());
+		dump_sigspec(f, cell->getPort("\\Y"));
+		f << stringf(" = ");
+	}
+	f << stringf("%s ", op.c_str());
 	dump_attributes(f, "", cell->attributes, ' ');
 	dump_cell_expr_port(f, cell, "A", true);
-	f << stringf(";\n");
+	if (!do_inline)
+	{
+		f << stringf(";\n");
+	}
 }
 
-void dump_cell_expr_binop(std::ostream &f, std::string indent, RTLIL::Cell *cell, std::string op)
+void dump_cell_expr_binop(std::ostream &f, std::string indent, RTLIL::Cell *cell, std::string op, bool do_inline)
 {
-	f << stringf("%s" "assign ", indent.c_str());
-	dump_sigspec(f, cell->getPort("\\Y"));
-	f << stringf(" = ");
+	if (!do_inline)
+	{
+		f << stringf("%s" "assign ", indent.c_str());
+		dump_sigspec(f, cell->getPort("\\Y"));
+		f << stringf(" = ");
+	}
+	else
+	{
+		f << stringf("(");
+	}
 	dump_cell_expr_port(f, cell, "A", true);
 	f << stringf(" %s ", op.c_str());
 	dump_attributes(f, "", cell->attributes, ' ');
 	dump_cell_expr_port(f, cell, "B", true);
-	f << stringf(";\n");
+	if (!do_inline)
+	{
+		f << stringf(";\n");
+	}
+	else
+	{
+		f << stringf(")");
+	}
 }
 
-bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell)
+bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell, bool do_inline)
 {
+	if (can_inline_cell_expr(cell) && !do_inline)
+		return true;
+
 	if (cell->type == "$_NOT_") {
 		f << stringf("%s" "assign ", indent.c_str());
 		dump_sigspec(f, cell->getPort("\\Y"));
@@ -631,9 +731,9 @@ bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell)
 	}
 
 #define HANDLE_UNIOP(_type, _operator) \
-	if (cell->type ==_type) { dump_cell_expr_uniop(f, indent, cell, _operator); return true; }
+	if (cell->type ==_type) { dump_cell_expr_uniop(f, indent, cell, _operator, do_inline); return true; }
 #define HANDLE_BINOP(_type, _operator) \
-	if (cell->type ==_type) { dump_cell_expr_binop(f, indent, cell, _operator); return true; }
+	if (cell->type ==_type) { dump_cell_expr_binop(f, indent, cell, _operator, do_inline); return true; }
 
 	HANDLE_UNIOP("$not", "~")
 	HANDLE_UNIOP("$pos", "+")
@@ -697,16 +797,30 @@ bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell)
 
 	if (cell->type == "$mux")
 	{
-		f << stringf("%s" "assign ", indent.c_str());
-		dump_sigspec(f, cell->getPort("\\Y"));
-		f << stringf(" = ");
+		if (!do_inline)
+		{
+			f << stringf("%s" "assign ", indent.c_str());
+			dump_sigspec(f, cell->getPort("\\Y"));
+			f << stringf(" = ");
+		}
+		else
+		{
+			f << stringf("(");
+		}
 		dump_sigspec(f, cell->getPort("\\S"));
 		f << stringf(" ? ");
 		dump_attributes(f, "", cell->attributes, ' ');
 		dump_sigspec(f, cell->getPort("\\B"));
 		f << stringf(" : ");
 		dump_sigspec(f, cell->getPort("\\A"));
-		f << stringf(";\n");
+		if (!do_inline)
+		{
+			f << stringf(";\n");
+		}
+		else
+		{
+			f << stringf(")");
+		}
 		return true;
 	}
 
@@ -1169,7 +1283,7 @@ bool dump_cell_expr(std::ostream &f, std::string indent, RTLIL::Cell *cell)
 void dump_cell(std::ostream &f, std::string indent, RTLIL::Cell *cell)
 {
 	if (cell->type[0] == '$' && !noexpr) {
-		if (dump_cell_expr(f, indent, cell))
+		if (dump_cell_expr(f, indent, cell, false))
 			return;
 	}
 
@@ -1317,25 +1431,42 @@ void dump_proc_switch(std::ostream &f, std::string indent, RTLIL::SwitchRule *sw
 void case_body_find_regs(RTLIL::CaseRule *cs)
 {
 	for (auto it = cs->switches.begin(); it != cs->switches.end(); ++it)
-	for (auto it2 = (*it)->cases.begin(); it2 != (*it)->cases.end(); it2++)
-		case_body_find_regs(*it2);
+	{
+		for (auto &c : (*it)->signal.chunks())
+			if (c.wire != NULL && c.offset == 0 && c.width == c.wire->width)
+				proc_consumed_wires[c.wire]++;
+		for (auto it2 = (*it)->cases.begin(); it2 != (*it)->cases.end(); it2++)
+			case_body_find_regs(*it2);
+	}
 
-	for (auto it = cs->actions.begin(); it != cs->actions.end(); ++it) {
+	for (auto it = cs->actions.begin(); it != cs->actions.end(); ++it)
+	{
 		for (auto &c : it->first.chunks())
+		{
 			if (c.wire != NULL)
 				reg_wires.insert(c.wire->name);
+			for (auto &c : it->second.chunks())
+				if (c.wire != NULL && c.offset == 0 && c.width == c.wire->width)
+					proc_consumed_wires[c.wire]++;
+		}
 	}
 }
 
-void dump_process(std::ostream &f, std::string indent, RTLIL::Process *proc, bool find_regs = false)
+void dump_process(std::ostream &f, std::string indent, RTLIL::Process *proc, bool sweep = false)
 {
-	if (find_regs) {
+	if (sweep) {
 		case_body_find_regs(&proc->root_case);
 		for (auto it = proc->syncs.begin(); it != proc->syncs.end(); ++it)
-		for (auto it2 = (*it)->actions.begin(); it2 != (*it)->actions.end(); it2++) {
-			for (auto &c : it2->first.chunks())
-				if (c.wire != NULL)
-					reg_wires.insert(c.wire->name);
+		{
+			for (auto it2 = (*it)->actions.begin(); it2 != (*it)->actions.end(); it2++)
+			{
+				for (auto &c : it2->first.chunks())
+					if (c.wire != NULL)
+						reg_wires.insert(c.wire->name);
+				for (auto &c : it2->second.chunks())
+					if (c.wire != NULL && c.offset == 0 && c.width == c.wire->width)
+						proc_consumed_wires[c.wire]++;
+			}
 		}
 		return;
 	}
@@ -1402,9 +1533,11 @@ void dump_process(std::ostream &f, std::string indent, RTLIL::Process *proc, boo
 void dump_module(std::ostream &f, std::string indent, RTLIL::Module *module)
 {
 	reg_wires.clear();
+	proc_consumed_wires.clear();
 	reset_auto_counter(module);
 	active_module = module;
 	active_sigmap.set(module);
+	active_modindex = ModIndex(module);
 	active_initdata.clear();
 
 	for (auto wire : module->wires())
@@ -1490,6 +1623,7 @@ void dump_module(std::ostream &f, std::string indent, RTLIL::Module *module)
 
 	f << stringf("%s" "endmodule\n", indent.c_str());
 	active_module = NULL;
+	active_modindex = ModIndex();
 	active_sigmap.clear();
 	active_initdata.clear();
 }
@@ -1520,7 +1654,12 @@ struct VerilogBackend : public Backend {
 		log("\n");
 		log("    -noexpr\n");
 		log("        without this option all internal cells are converted to Verilog\n");
-		log("        expressions.\n");
+		log("        expressions. implies -noinline.\n");
+		log("\n");
+		log("    -noinline\n");
+		log("        without this option all internal cells driving a wire connected to\n");
+		log("        a single internal cell are inlined into that cell and the wire is\n");
+		log("        omitted.\n");
 		log("\n");
 		log("    -nodec\n");
 		log("        32-bit constant values are by default dumped as decimal numbers,\n");
@@ -1573,6 +1712,7 @@ struct VerilogBackend : public Backend {
 		noattr = false;
 		attr2comment = false;
 		noexpr = false;
+		noinline = false;
 		nodec = false;
 		nohex = false;
 		nostr = false;
@@ -1631,7 +1771,11 @@ struct VerilogBackend : public Backend {
 				continue;
 			}
 			if (arg == "-noexpr") {
-				noexpr = true;
+				noexpr = noinline = true;
+				continue;
+			}
+			if (arg == "-noinline") {
+				noinline = true;
 				continue;
 			}
 			if (arg == "-nodec") {
